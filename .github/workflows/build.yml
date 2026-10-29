@@ -1,0 +1,102 @@
+# Build -> scan -> push -> bump the dev image tag in Git. Flux does the actual deploy.
+# Promotion to prod is a separate, manual step: see promote.yml.
+#
+# Required repository variables (Settings > Secrets and variables > Actions > Variables):
+#   AWS_ROLE_ARN   terraform output github_actions_role_arn
+#   AWS_REGION     e.g. us-east-1
+#
+
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to commit the image tag bump
+  id-token: write   # to request the OIDC token for AWS
+
+concurrency:
+  group: build-and-release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: pytest -q apps/consumer/tests
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        app: [producer, consumer]
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/event-pipeline/${{ matrix.app }}:${IMAGE_TAG}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE" "apps/${{ matrix.app }}"
+
+      - name: Scan image with Trivy (fail on fixable CRITICAL vulns)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  bump-tag:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update image tags in the dev overlay
+        run: |
+          for app in producer consumer; do
+            yq -i '.spec.values.image.tag = "${{ github.sha }}"' "platform/apps/overlays/dev/${app}-patch.yaml"
+          done
+          git diff --stat
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add platform/apps/overlays/dev/
+          if git diff --cached --quiet; then
+            echo "No tag change to commit"
+            exit 0
+          fi
+          git commit -m "deploy(dev): producer and consumer ${GITHUB_SHA::7} [skip ci]"
+          git pull --rebase
+          git push
