@@ -1,0 +1,16 @@
+# Newer EKS clusters ship without a default StorageClass. This one makes
+# encrypted gp3 the default so every PVC (Kafka, Postgres, Elasticsearch)
+# gets an EBS volume from the CSI driver installed by Terraform.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  encrypted: "true"

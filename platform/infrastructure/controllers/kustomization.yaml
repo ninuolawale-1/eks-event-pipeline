@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - sources.yaml
+  - strimzi.yaml
+  - eck.yaml
+  - cloudnative-pg.yaml
+  - keda.yaml
+  - kube-prometheus-stack.yaml
