@@ -1,0 +1,42 @@
+{{- with .Values.autoscaling.keda }}
+{{- if .enabled }}
+{{- if not (and .kafka.bootstrapServers .kafka.consumerGroup .kafka.topic) }}
+{{- fail "autoscaling.keda.kafka.bootstrapServers, consumerGroup, and topic are required when KEDA is enabled" }}
+{{- end }}
+# KEDA creates and manages an HPA from this. It scales the Deployment on
+# Kafka consumer-group lag: desired replicas ~= total lag / lagThreshold.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "pipeline-app.name" $ }}
+  labels:
+    {{- include "pipeline-app.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "pipeline-app.name" $ }}
+  minReplicaCount: {{ .minReplicas }}
+  maxReplicaCount: {{ .maxReplicas }}
+  pollingInterval: {{ .pollingInterval }}
+  cooldownPeriod: {{ .cooldownPeriod }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Scale down one pod per minute so a brief dip in lag doesn't
+          # trigger a burst of consumer-group rebalances
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ .kafka.bootstrapServers | quote }}
+        consumerGroup: {{ .kafka.consumerGroup | quote }}
+        topic: {{ .kafka.topic | quote }}
+        lagThreshold: {{ .kafka.lagThreshold | quote }}
+        offsetResetPolicy: earliest
+        allowIdleConsumers: "false"
+{{- end }}
+{{- end }}

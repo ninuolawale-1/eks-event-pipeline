@@ -1,0 +1,70 @@
+# One chart, two releases. The producer and consumer HelmReleases in
+# platform/apps/ override these values.
+
+# Ignored when autoscaling.keda.enabled is true (KEDA sets replicas instead)
+replicaCount: 1
+
+image:
+  repository: ""   # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/event-pipeline/producer
+  tag: ""          # set by CI to the git commit SHA
+  pullPolicy: IfNotPresent
+
+# Plain env vars and secret references, passed straight into the container
+env: []
+#  - name: KAFKA_BOOTSTRAP_SERVERS
+#    value: events-kafka-bootstrap:9092
+#  - name: PG_DSN
+#    valueFrom:
+#      secretKeyRef: { name: events-db-app, key: uri }
+
+metrics:
+  port: 8000
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  labels: {}
+
+autoscaling:
+  keda:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 6
+    pollingInterval: 15     # seconds between lag checks
+    cooldownPeriod: 120     # seconds of low lag before scaling back down
+    kafka:
+      bootstrapServers: ""
+      consumerGroup: ""
+      topic: ""
+      lagThreshold: "200"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+podDisruptionBudget:
+  enabled: false
+  # maxUnavailable works with any replica count, including 1, so node drains
+  # never get blocked the way minAvailable: 1 would block them
+  maxUnavailable: 1
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

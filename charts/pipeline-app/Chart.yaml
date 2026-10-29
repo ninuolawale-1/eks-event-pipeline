@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pipeline-app
+description: Generic chart for the event pipeline's Python services (producer and consumer).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: Ninu Olawale
+    url: https://github.com/ninuolawale-1
