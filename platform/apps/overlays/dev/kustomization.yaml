@@ -1,0 +1,9 @@
+# dev: the environment this lab actually runs. CI updates the image tags in
+# the two patch files on every merge to main, and Flux deploys them.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: producer-patch.yaml
+  - path: consumer-patch.yaml

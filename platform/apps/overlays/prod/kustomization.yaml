@@ -1,0 +1,76 @@
+# prod: same pipeline, sized for durability instead of cost.
+#
+# This overlay isn't deployed in the lab (that would need a second cluster),
+# but it shows how one base turns into two environments, and the promote
+# workflow (.github/workflows/promote.yml) moves tested image tags into it.
+# Preview the full rendered output with:
+#   kubectl kustomize platform/apps/overlays/prod
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  # Promoted image tag, more consumer headroom
+  - path: consumer-patch.yaml
+
+  # Real traffic only: no synthetic producer in prod
+  - patch: |-
+      $patch: delete
+      apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      metadata:
+        name: producer
+        namespace: pipeline
+
+  # Elasticsearch: 3 nodes so every index can carry a replica
+  - target:
+      kind: Elasticsearch
+      name: events
+    patch: |-
+      - op: replace
+        path: /spec/nodeSets/0/count
+        value: 3
+
+  # Tell the consumer to create indices with one replica
+  - target:
+      kind: HelmRelease
+      name: consumer
+    patch: |-
+      - op: add
+        path: /spec/values/env/-
+        value:
+          name: ES_INDEX_REPLICAS
+          value: "1"
+
+  # Kafka: bigger disks that survive cluster deletion
+  - target:
+      kind: KafkaNodePool
+      name: dual-role
+    patch: |-
+      - op: replace
+        path: /spec/storage/volumes/0/size
+        value: 50Gi
+      - op: replace
+        path: /spec/storage/volumes/0/deleteClaim
+        value: false
+
+  # PostgreSQL: primary plus two replicas, larger volume
+  - target:
+      kind: Cluster
+      name: events-db
+    patch: |-
+      - op: replace
+        path: /spec/instances
+        value: 3
+      - op: replace
+        path: /spec/storage/size
+        value: 20Gi
+
+  # Keep events longer
+  - target:
+      kind: KafkaTopic
+      name: auth-events
+    patch: |-
+      - op: replace
+        path: /spec/config/retention.ms
+        value: 604800000

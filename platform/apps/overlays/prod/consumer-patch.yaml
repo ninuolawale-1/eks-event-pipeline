@@ -1,0 +1,19 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: consumer
+  namespace: pipeline
+spec:
+  values:
+    image:
+      tag: set-by-ci   # .github/workflows/promote.yml copies the tested dev tag here
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+    autoscaling:
+      keda:
+        minReplicas: 2   # survive one pod loss without a cold start
+        maxReplicas: 6

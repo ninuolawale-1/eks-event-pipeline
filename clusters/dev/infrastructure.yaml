@@ -1,0 +1,39 @@
+# Flux reconciles these in order:
+#   infra-configs (StorageClass) and infra-controllers (operators + monitoring)
+#   -> pipeline (Kafka, Postgres, Elasticsearch, your apps)
+#
+# `flux bootstrap` creates clusters/dev/flux-system/ next to this file.
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-configs
+  namespace: flux-system
+spec:
+  interval: 10m
+  retryInterval: 1m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./platform/infrastructure/configs
+  prune: true
+  wait: true
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-controllers
+  namespace: flux-system
+spec:
+  interval: 10m
+  retryInterval: 1m
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./platform/infrastructure/controllers
+  prune: true
+  # Wait until every operator is healthy so its CRDs exist before the
+  # pipeline Kustomization creates Kafka / Cluster / Elasticsearch resources
+  wait: true

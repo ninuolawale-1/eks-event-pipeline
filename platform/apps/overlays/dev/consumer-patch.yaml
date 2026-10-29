@@ -1,0 +1,9 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: consumer
+  namespace: pipeline
+spec:
+  values:
+    image:
+      tag: set-by-ci   # .github/workflows/build.yml writes the commit SHA here

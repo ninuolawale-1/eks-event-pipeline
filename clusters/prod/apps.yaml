@@ -1,0 +1,21 @@
+# Entry point for a prod cluster. Not bootstrapped in the lab; to use it,
+# provision a second cluster and run flux bootstrap with --path=clusters/prod.
+
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pipeline
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infra-configs
+    - name: infra-controllers
+  interval: 5m
+  retryInterval: 1m
+  timeout: 20m   # Elasticsearch and a 3-broker Kafka cluster take a while on first boot
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./platform/apps/overlays/prod
+  prune: true
+  wait: true
