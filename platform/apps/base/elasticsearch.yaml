@@ -1,0 +1,45 @@
+# Single-node Elasticsearch managed by ECK. The dev overlay uses this as-is;
+# the prod overlay scales it to three nodes.
+#
+# ECK turns on authentication automatically and stores the `elastic` user's
+# password in Secret events-es-elastic-user. HTTP TLS is disabled here to keep
+# the Python client simple; turning it back on is listed as a follow-up in
+# docs/architecture.md.
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: events
+  namespace: pipeline
+spec:
+  version: 8.18.0
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+  nodeSets:
+    - name: default
+      count: 1
+      config:
+        # Avoids needing a privileged init container to raise vm.max_map_count
+        node.store.allow_mmap: false
+      podTemplate:
+        spec:
+          containers:
+            - name: elasticsearch
+              env:
+                - name: ES_JAVA_OPTS
+                  value: "-Xms1g -Xmx1g"
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 2Gi
+                limits:
+                  memory: 2Gi
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 10Gi

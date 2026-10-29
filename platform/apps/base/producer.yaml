@@ -1,0 +1,41 @@
+# Synthetic traffic generator. Only deployed in dev; the prod overlay removes it.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: producer
+  namespace: pipeline
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: ./charts/pipeline-app
+      # Re-render whenever the Git commit changes, even without a chart version bump
+      reconcileStrategy: Revision
+      sourceRef:
+        kind: GitRepository
+        name: flux-system
+        namespace: flux-system
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  # If someone changes the Deployment by hand (kubectl scale, kubectl set env),
+  # Flux puts it back to what Git says on the next reconcile.
+  driftDetection:
+    mode: enabled
+  values:
+    replicaCount: 1
+    image:
+      repository: __AWS_ACCOUNT_ID__.dkr.ecr.__AWS_REGION__.amazonaws.com/event-pipeline/producer
+      tag: set-by-ci   # each overlay sets the real tag
+    env:
+      - name: KAFKA_BOOTSTRAP_SERVERS
+        value: events-kafka-bootstrap.pipeline.svc:9092
+      - name: KAFKA_TOPIC
+        value: auth-events
+      - name: EVENTS_PER_SECOND
+        value: "5"
+      - name: ATTACK_PROBABILITY
+        value: "0.02"

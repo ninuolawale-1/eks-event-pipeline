@@ -1,0 +1,110 @@
+# Alert rules for the pipeline. Prometheus evaluates these; firing alerts show
+# up in Alertmanager (port-forward with `make ui`). Each alert links to a
+# runbook section in docs/runbooks.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: event-pipeline
+  namespace: pipeline
+spec:
+  groups:
+    - name: event-pipeline.flow
+      rules:
+        - alert: ConsumerLagHigh
+          expr: sum(kafka_consumergroup_lag{consumergroup="auth-event-consumer"}) > 5000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Consumer is {{ $value | humanize }} messages behind"
+            description: "Lag on auth-events has stayed above 5000 for 10 minutes, even with KEDA scaling."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#consumerlaghigh"
+
+        - alert: ConsumerAtMaxReplicas
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{namespace="pipeline", horizontalpodautoscaler="keda-hpa-consumer"}
+              >= kube_horizontalpodautoscaler_spec_max_replicas{namespace="pipeline", horizontalpodautoscaler="keda-hpa-consumer"}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Consumer autoscaling is pinned at its maximum"
+            description: "KEDA can't add more consumers. Lag will keep growing if load stays this high."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#consumeratmaxreplicas"
+
+        - alert: PipelineStalled
+          expr: |
+            sum(rate(events_produced_total[5m])) > 0
+              and sum(rate(events_consumed_total[5m])) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Events are being produced but nothing is being written"
+            description: "The consumer has written zero events for 5 minutes while the producer is active."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#pipelinestalled"
+
+        - alert: EndToEndLatencyHigh
+          expr: |
+            histogram_quantile(0.95, sum by (le) (rate(event_end_to_end_seconds_bucket[5m]))) > 60
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 event latency is {{ $value | humanizeDuration }}"
+            description: "Events are taking over a minute to go from producer to both sinks."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#endtoendlatencyhigh"
+
+    - name: event-pipeline.errors
+      rules:
+        - alert: SinkWriteErrors
+          expr: sum by (sink) (increase(sink_errors_total[5m])) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Repeated write failures to {{ $labels.sink }}"
+            description: "More than 5 failed writes in 5 minutes. The consumer retries, then restarts if the sink stays down."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#sinkwriteerrors"
+
+        - alert: DeadLetterQueueReceiving
+          expr: sum(increase(events_dlq_total[15m])) > 0
+          labels:
+            severity: info
+          annotations:
+            summary: "{{ $value | humanize }} malformed events sent to the DLQ"
+            description: "Some messages failed validation and were parked in auth-events-dlq."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#deadletterqueuereceiving"
+
+        - alert: PipelinePodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="pipeline"}[15m]) > 3
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.pod }} has restarted {{ $value | humanize }} times in 15 minutes"
+            description: "A pod in the pipeline namespace is crash-looping."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#pipelinepodcrashlooping"
+
+    - name: event-pipeline.capacity
+      rules:
+        - alert: KafkaUnderReplicatedPartitions
+          expr: sum(kafka_topic_partition_under_replicated_partition{namespace="pipeline"}) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $value | humanize }} Kafka partitions are under-replicated"
+            description: "At least one partition has fewer in-sync replicas than configured. Usually a broker is down or slow."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#kafkaunderreplicatedpartitions"
+
+        - alert: PersistentVolumeFillingUp
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace="pipeline"}
+              / kubelet_volume_stats_capacity_bytes{namespace="pipeline"} < 0.15
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} free"
+            description: "Less than 15% space left on a Kafka, Postgres, or Elasticsearch volume."
+            runbook_url: "https://github.com/__GITHUB_OWNER__/eks-event-pipeline/blob/main/docs/runbooks.md#persistentvolumefillingup"

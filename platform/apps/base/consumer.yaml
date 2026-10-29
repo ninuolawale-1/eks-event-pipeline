@@ -1,0 +1,80 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: consumer
+  namespace: pipeline
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: ./charts/pipeline-app
+      reconcileStrategy: Revision
+      sourceRef:
+        kind: GitRepository
+        name: flux-system
+        namespace: flux-system
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  driftDetection:
+    mode: enabled
+    ignore:
+      # KEDA owns the replica count, so Flux shouldn't fight it
+      - paths: ["/spec/replicas"]
+        target:
+          kind: Deployment
+  values:
+    image:
+      repository: __AWS_ACCOUNT_ID__.dkr.ecr.__AWS_REGION__.amazonaws.com/event-pipeline/consumer
+      tag: set-by-ci   # each overlay sets the real tag
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 384Mi
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+    # Scale on Kafka consumer-group lag instead of CPU. A consumer that's
+    # falling behind is often waiting on I/O, so CPU alone would miss it.
+    autoscaling:
+      keda:
+        enabled: true
+        minReplicas: 1
+        maxReplicas: 6          # more consumers than partitions would sit idle
+        pollingInterval: 15
+        cooldownPeriod: 120
+        kafka:
+          bootstrapServers: events-kafka-bootstrap.pipeline.svc:9092
+          consumerGroup: auth-event-consumer
+          topic: auth-events
+          lagThreshold: "200"   # target lag per replica
+    env:
+      - name: KAFKA_BOOTSTRAP_SERVERS
+        value: events-kafka-bootstrap.pipeline.svc:9092
+      - name: KAFKA_TOPIC
+        value: auth-events
+      - name: KAFKA_DLQ_TOPIC
+        value: auth-events-dlq
+      - name: KAFKA_GROUP_ID
+        value: auth-event-consumer
+      - name: PG_DSN
+        valueFrom:
+          secretKeyRef:
+            name: events-db-app        # created by CloudNativePG
+            key: uri
+      - name: ES_URL
+        value: http://events-es-http.pipeline.svc:9200
+      - name: ES_USER
+        value: elastic
+      - name: ES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: events-es-elastic-user   # created by ECK
+            key: elastic
+      - name: PROCESSING_DELAY_MS
+        value: "0"
