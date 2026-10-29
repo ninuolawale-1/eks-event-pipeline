@@ -1,0 +1,70 @@
+# Static checks on every pull request and push. No AWS access needed.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive terraform
+      - name: Validate main stack and bootstrap stack
+        run: |
+          for dir in terraform terraform/bootstrap; do
+            echo "== $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff pytest
+      - run: ruff check apps/
+      - run: pytest -q apps/consumer/tests
+
+  kubernetes:
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFORM_VERSION: v0.6.7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Lint and render the app chart (with and without KEDA)
+        run: |
+          helm lint charts/pipeline-app --set image.repository=example/app
+          helm template t charts/pipeline-app --set image.repository=example/app > /dev/null
+          helm template t charts/pipeline-app --set image.repository=example/app \
+            --set autoscaling.keda.enabled=true \
+            --set autoscaling.keda.kafka.bootstrapServers=k:9092 \
+            --set autoscaling.keda.kafka.consumerGroup=g \
+            --set autoscaling.keda.kafka.topic=t > /dev/null
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /usr/local/bin kubeconform
+
+      - name: Build and schema-check every kustomization
+        run: |
+          for dir in platform/infrastructure/configs platform/infrastructure/controllers \
+                     platform/apps/overlays/dev platform/apps/overlays/prod; do
+            echo "== $dir"
+            kubectl kustomize "$dir" | kubeconform -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              -ignore-missing-schemas
+          done
