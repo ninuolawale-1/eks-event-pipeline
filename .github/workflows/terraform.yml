@@ -1,0 +1,118 @@
+# Terraform on pull requests: format check, validate, Checkov IaC scan, and a
+# plan posted as a PR comment so infrastructure changes get reviewed like code.
+#
+# Apply stays manual on purpose (it creates billable resources). The natural
+# next step is apply-on-merge behind a GitHub Environment with required reviewers.
+#
+# Required repository variables:
+#   TF_PLAN_ROLE_ARN   terraform output github_terraform_plan_role_arn
+#   TF_STATE_BUCKET    terraform/bootstrap output state_bucket
+#   AWS_REGION         e.g. us-east-1
+# Optional:
+#   TF_ENDPOINT_CIDRS  JSON list matching your tfvars, e.g. ["203.0.113.7/32"]
+
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  id-token: write        # OIDC to AWS
+  pull-requests: write   # post the plan comment
+
+concurrency:
+  group: terraform-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: terraform
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_github_owner: ${{ github.repository_owner }}
+  TF_VAR_github_repo: ${{ github.event.repository.name }}
+  TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+  TF_VAR_endpoint_public_access_cidrs: ${{ vars.TF_ENDPOINT_CIDRS || '["0.0.0.0/0"]' }}
+
+jobs:
+  plan:
+    # PRs from forks can't get an OIDC token for this repo's role
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Checkov IaC scan
+        working-directory: .
+        run: |
+          pip install --quiet checkov
+          checkov --directory terraform --framework terraform --compact --quiet --soft-fail \
+            --output cli --output github_failed_only --output-file-path console,checkov-results.md
+          cat checkov-results.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Configure AWS credentials (read-only plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          # 0 = no changes, 2 = changes present, anything else = error
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then exit "$code"; fi
+
+      - name: Post plan to the pull request
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        env:
+          EXIT_CODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan -->';
+            let plan = fs.existsSync('terraform/plan.txt') ? fs.readFileSync('terraform/plan.txt', 'utf8') : 'plan.txt not found';
+            const max = 60000;
+            if (plan.length > max) plan = plan.slice(-max) + '\n... (truncated, see the workflow log)';
+            const status = { '0': 'No changes', '2': 'Changes to apply' }[process.env.EXIT_CODE] || 'Plan failed';
+            const body = `${marker}\n### Terraform plan: ${status}\n\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>\n\n_Commit ${context.sha.slice(0, 7)}. Apply is run manually after merge._`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }
