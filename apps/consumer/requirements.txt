@@ -1,0 +1,5 @@
+confluent-kafka>=2.6,<3
+prometheus-client>=0.21,<1
+psycopg[binary]>=3.2,<4
+# Client major version must match the Elasticsearch server major version (8.x)
+elasticsearch>=8.15,<9
