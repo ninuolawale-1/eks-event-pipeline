@@ -1,0 +1,70 @@
+# Promote the consumer image currently running in dev to prod.
+#
+# Run manually (Actions > promote-to-prod > Run workflow). It opens a pull
+# request instead of pushing straight to main, so the review/merge is the
+# approval gate. Once merged, Flux on the prod cluster deploys it.
+
+name: promote-to-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to promote (leave blank to use whatever dev is running)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out which tag to promote
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(yq '.spec.values.image.tag' platform/apps/overlays/dev/consumer-patch.yaml)"
+          fi
+          if [ "$TAG" = "set-by-ci" ] || [ -z "$TAG" ]; then
+            echo "::error::dev has no real image tag yet. Run build-and-release first."
+            exit 1
+          fi
+          CURRENT="$(yq '.spec.values.image.tag' platform/apps/overlays/prod/consumer-patch.yaml)"
+          if [ "$TAG" = "$CURRENT" ]; then
+            echo "::notice::prod is already on $TAG. Nothing to promote."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "short=${TAG::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Update the prod overlay
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          yq -i '.spec.values.image.tag = "${{ steps.tag.outputs.tag }}"' platform/apps/overlays/prod/consumer-patch.yaml
+          git diff
+
+      - name: Open a pull request
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="promote/consumer-${{ steps.tag.outputs.short }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deploy(prod): consumer ${{ steps.tag.outputs.short }}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "Promote consumer ${{ steps.tag.outputs.short }} to prod" \
+            --body "Promotes consumer image \`${{ steps.tag.outputs.tag }}\` from dev to prod.
+
+          Before merging, confirm in dev:
+          - [ ] No firing alerts in Alertmanager
+          - [ ] Consumer lag is stable on the Event Pipeline dashboard
+          - [ ] No new messages in the DLQ"
