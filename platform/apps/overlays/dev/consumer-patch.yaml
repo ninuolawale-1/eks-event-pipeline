@@ -6,4 +6,4 @@ metadata:
 spec:
   values:
     image:
-      tag: set-by-ci   # .github/workflows/build.yml writes the commit SHA here
+      tag: c47a2dbe3e756856351e9a7e262c24447433233e # .github/workflows/build.yml writes the commit SHA here
