@@ -5,6 +5,7 @@
 #   AWS_ROLE_ARN   terraform output github_actions_role_arn
 #   AWS_REGION     e.g. us-east-1
 #
+# Hardening tip: pin third-party actions to full commit SHAs instead of tags.
 
 name: build-and-release
 
@@ -64,13 +65,12 @@ jobs:
           docker build -t "$IMAGE" "apps/${{ matrix.app }}"
 
       - name: Scan image with Trivy (fail on fixable CRITICAL vulns)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.IMAGE }}
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
-          format: table
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "$IMAGE"
 
       - name: Push image
         run: docker push "$IMAGE"
