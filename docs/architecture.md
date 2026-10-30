@@ -70,7 +70,7 @@ flowchart LR
 | Shortcut | Production approach |
 |---|---|
 | Single NAT gateway | One NAT per AZ |
-| Spot nodes running stateful workloads | On-demand node group for stateful pods, spot (or Karpenter) for stateless |
+| Two on-demand nodes with little headroom | Separate node groups for stateful and stateless pods, with Karpenter or Cluster Autoscaler |
 | Kafka nodes are combined controller+broker | Separate controller and broker node pools |
 | Elasticsearch HTTP TLS disabled | Keep ECK's TLS and mount the CA in the consumer |
 | Plain Kafka listener | TLS listener with mTLS `KafkaUser`s and ACLs |

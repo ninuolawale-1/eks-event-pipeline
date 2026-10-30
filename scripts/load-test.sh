@@ -51,4 +51,4 @@ while (( SECONDS < END )); do
 done
 
 echo
-echo "Load test finished. Record peak replicas, peak lag, and drain time in docs/failure-tests.md."
+echo "Load test finished. Note the peak replicas, peak lag, and drain time from Grafana."

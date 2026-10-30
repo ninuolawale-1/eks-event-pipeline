@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Phase 6: break something on purpose and time the recovery.
-# Record each result in docs/failure-tests.md.
+# Break something on purpose and time the recovery.
 #
 #   ./scripts/chaos-test.sh kafka      # delete one Kafka broker pod
 #   ./scripts/chaos-test.sh postgres   # delete the Postgres primary (forces failover)
@@ -32,7 +31,15 @@ kubectl delete pod "$POD" -n "$NS" --wait=false
 echo "Deleted at $(date -u +%H:%M:%SZ). Waiting for all matching pods to be Ready..."
 
 sleep 5
-kubectl wait pods -n "$NS" -l "$SELECTOR" --for=condition=Ready --timeout=600s
+if [[ "$TARGET" == "postgres" ]]; then
+  # During failover no pod carries the primary label for a while, so wait on
+  # the cluster's own status instead of a pod.
+  until [[ "$(kubectl get clusters.postgresql.cnpg.io events-db -n "$NS" -o jsonpath='{.status.phase}')" == "Cluster in healthy state" ]]; do
+    sleep 5
+  done
+else
+  kubectl wait pods -n "$NS" -l "$SELECTOR" --for=condition=Ready --timeout=600s
+fi
 END=$(date +%s)
 
 if [[ "$TARGET" == "postgres" ]]; then

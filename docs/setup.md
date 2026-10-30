@@ -32,8 +32,12 @@ make local-down
 
 ```bash
 make state                                   # one time; kept between rebuilds
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-# set github_owner and endpoint_public_access_cidrs
+# create terraform/terraform.tfvars (git-ignored), for example:
+#   github_owner                 = "<github-user>"
+#   endpoint_public_access_cidrs = ["<your-ip>/32"]
+#   node_capacity_type           = "ON_DEMAND"
+#   node_min_size = 2, node_desired_size = 2, node_max_size = 2
+#   github_oidc_sub_prefix       = "<from: gh api repos/OWNER/REPO/actions/oidc/customization/sub>"
 make tf-init
 make tf-plan
 make tf-apply                                # ~15-20 minutes
@@ -102,6 +106,9 @@ The S3 state bucket is kept. To rebuild, start again from `make tf-apply`.
 | Pods `Pending` | `kubectl describe pod`; if memory, raise `node_desired_size` and re-apply |
 | Flux Kustomization not Ready | `flux logs --level=error`, `flux get helmreleases -A` |
 | Terraform plan workflow fails on init | Check `TF_STATE_BUCKET` and `TF_PLAN_ROLE_ARN` variables |
+| Node group stuck in `CREATING`, no instances | Check EC2 vCPU quotas (`aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A`) |
+| `not eligible for Free Tier` on launch | The AWS account is on the Free plan; upgrade it in Billing |
+| CI fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Repo uses immutable OIDC subjects; set `github_oidc_sub_prefix` in tfvars and re-apply |
 
 ## Versions (as of October 2026)
 

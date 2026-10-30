@@ -67,8 +67,8 @@
 <rect x="498" y="314" width="407" height="26" rx="6" fill="#3b82f6"/>
 <text x="701.5" y="332" font-family="Inter, DejaVu Sans, sans-serif" font-size="13.5" font-weight="600" fill="#ffffff" text-anchor="middle">VPC  |  3 AZs, private subnets, NAT gateway</text>
 <rect x="500" y="356" width="1130" height="636" rx="10" fill="#ffffff" stroke="#326ce5" stroke-width="2"/>
-<rect x="518" y="370" width="524" height="26" rx="6" fill="#326ce5"/>
-<text x="780.0" y="388" font-family="Inter, DejaVu Sans, sans-serif" font-size="13.5" font-weight="600" fill="#ffffff" text-anchor="middle">Amazon EKS 1.35  |  managed node group, 3x t3.large spot</text>
+<rect x="518" y="370" width="569" height="26" rx="6" fill="#326ce5"/>
+<text x="802.5" y="388" font-family="Inter, DejaVu Sans, sans-serif" font-size="13.5" font-weight="600" fill="#ffffff" text-anchor="middle">Amazon EKS 1.35  |  managed node group, 2x t3.large on-demand</text>
 <rect x="524" y="412" width="300" height="112" rx="10" fill="#f3f7ff" stroke="#326ce5" stroke-width="2"/>
 <rect x="524" y="412" width="6" height="112" rx="3" fill="#326ce5"/>
 <text x="677.0" y="440" font-family="Inter, DejaVu Sans, sans-serif" font-size="16" font-weight="700" fill="#1f2933" text-anchor="middle">Flux</text>
