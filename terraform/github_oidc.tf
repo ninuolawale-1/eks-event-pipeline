@@ -15,6 +15,12 @@ data "aws_iam_openid_connect_provider" "github" {
 }
 
 locals {
+  github_sub_prefix = (
+    var.github_oidc_sub_prefix != ""
+    ? var.github_oidc_sub_prefix
+    : "repo:${var.github_owner}/${var.github_repo}"
+  )
+
   github_oidc_provider_arn = (
     var.create_github_oidc_provider
     ? aws_iam_openid_connect_provider.github[0].arn
@@ -42,7 +48,7 @@ data "aws_iam_policy_document" "github_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/${var.github_branch}"]
+      values   = ["${local.github_sub_prefix}:ref:refs/heads/${var.github_branch}"]
     }
   }
 }
@@ -109,7 +115,7 @@ data "aws_iam_policy_document" "github_plan_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_owner}/${var.github_repo}:pull_request"]
+      values   = ["${local.github_sub_prefix}:pull_request"]
     }
   }
 }

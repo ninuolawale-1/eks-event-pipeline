@@ -77,6 +77,12 @@ variable "github_branch" {
   default     = "main"
 }
 
+variable "github_oidc_sub_prefix" {
+  description = "Subject prefix GitHub puts in OIDC tokens for this repo. Leave empty for the classic repo:OWNER/REPO format; set it when the repo uses immutable subjects (check with: gh api repos/OWNER/REPO/actions/oidc/customization/sub)."
+  type        = string
+  default     = ""
+}
+
 variable "create_github_oidc_provider" {
   description = "Set to false if your AWS account already has the token.actions.githubusercontent.com OIDC provider."
   type        = bool
