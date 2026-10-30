@@ -3,7 +3,7 @@
 <img width="900" src="docs/images/architecture.png" alt="Architecture diagram: a producer publishes events to Kafka on EKS; a consumer that KEDA scales on Kafka lag writes them to PostgreSQL and Elasticsearch; Flux syncs the cluster from Git, GitHub Actions builds and scans images into ECR, and Prometheus, Grafana, and Alertmanager monitor the platform"/>
 
 ## Platforms and Languages Leveraged
-- Amazon Web Services (EKS, EC2, EBS, ECR, VPC, IAM, S3, EKS Pod Identity)
+- Amazon Web Services (EKS, EC2, EBS, ECR, VPC, IAM, S3, EKS Pod Identity, Service Quotas)
 - Terraform (HashiCorp Configuration Language), AWS Provider 6.x, terraform-aws-modules (EKS v21, VPC v6)
 - Kubernetes 1.35 (Helm, Kustomize, HPA, PodDisruptionBudgets, Pod Security Standards)
 - Flux (GitOps, HelmReleases, drift detection)
@@ -28,7 +28,7 @@ This platform streams events through a three-broker Kafka cluster into PostgreSQ
 - **Scale** the consumer on Kafka lag with KEDA instead of CPU.
 - **Observe** the platform with Prometheus metrics, a Grafana dashboard, and alert rules backed by runbooks.
 - **Separate** dev and prod with Kustomize overlays and a pull-request-based promotion workflow.
-- **Validate** the platform by loading it and breaking it on purpose.
+- **Validate** the platform by breaking it on purpose.
 
 ---
 
@@ -36,7 +36,7 @@ This platform streams events through a three-broker Kafka cluster into PostgreSQ
 
 ### 1. Provisioned the Platform in Terraform
 
-Defined a three-AZ VPC with private subnets for worker nodes, a single NAT gateway to keep costs down, and an EKS cluster running Kubernetes 1.35 with one managed node group of spot instances. Terraform state lives in an S3 bucket created by a separate bootstrap stack, with native S3 locking, so local runs and CI read the same state.
+Defined a three-AZ VPC with private subnets for worker nodes, a single NAT gateway to keep costs down, and an EKS cluster running Kubernetes 1.35 with a managed node group of two on-demand `t3.large` instances. Terraform state lives in an S3 bucket created by a separate bootstrap stack, with native S3 locking, so local runs and CI read the same state.
 
 The EBS CSI driver, which every database and Kafka volume depends on, authenticates through EKS Pod Identity rather than a role attached to the nodes. That keeps storage permissions scoped to the one pod that needs them instead of every pod on the node.
 
@@ -49,23 +49,32 @@ The EBS CSI driver, which every database and Kafka volume depends on, authentica
     }
 ```
 
-<!-- TODO: add a short note on anything that went wrong during the first apply and how you fixed it -->
+Getting the first apply through took several rounds of troubleshooting:
+
+- **Credentials expired mid-apply.** The temporary session from `aws login` expired while EKS was still creating, so Terraform couldn't save its state or release its lock. I pushed the saved `errored.tfstate` back to S3, released the stale lock with `force-unlock`, and cleared the cluster's tainted flag so Terraform stopped trying to create a duplicate.
+- **The node group hung with no error.** It sat in `CREATING` for 30 minutes with no Auto Scaling group and no EC2 instances. Checking Service Quotas showed the account was capped at 5 vCPUs, and three 2-vCPU nodes need 6. I dropped to two nodes and requested a quota increase.
+- **On-demand launches were rejected.** The retry failed with `InvalidParameterCombination: not eligible for Free Tier`. The account was on the AWS Free plan, which only allows Free Tier instance types. Upgrading to the paid plan fixed it.
 
 **Deployed resources in AWS.**
 
-<!-- TODO: screenshot of the EKS cluster, node group, and ECR repositories in the AWS console -->
-<img width="900" src="docs/images/01-aws-resources.png" alt="Screenshot: AWS console showing the EKS cluster, managed node group, and ECR repositories"/>
+<img width="900" src="docs/images/01-aws-resources.png" alt="Screenshot: EKS console showing two Ready on-demand t3.large nodes in an Active managed node group"/>
 
 ### 2. Replaced Stored Credentials With OIDC Federation
 
 GitHub Actions authenticates to AWS with short-lived OIDC tokens instead of access keys. There are two roles, and each trusts a different kind of workflow run. The push role only accepts tokens from the `main` branch and can only push to the two ECR repositories. The Terraform plan role only accepts tokens from pull requests and has read-only access, so a pull request can show what would change but can never change anything.
 
+The first build failed with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. The trust policy expected the classic subject format, `repo:OWNER/REPO`, but this repository sends GitHub's newer **immutable subject**, which embeds numeric IDs for the owner and repo (`repo:OWNER@ID/REPO@ID`). Those IDs survive renames, so a deleted repo name can't be re-registered and inherit the trust. I made the subject prefix a Terraform variable so both roles match what GitHub actually sends.
+
 ```hcl
-  values = ["repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/${var.github_branch}"]
+  github_sub_prefix = (
+    var.github_oidc_sub_prefix != ""
+    ? var.github_oidc_sub_prefix
+    : "repo:${var.github_owner}/${var.github_repo}"
+  )
 ```
 
 ```hcl
-  values = ["repo:${var.github_owner}/${var.github_repo}:pull_request"]
+  values = ["${local.github_sub_prefix}:ref:refs/heads/${var.github_branch}"]
 ```
 
 ### 3. Deployed Stateful Services Through Operators, Managed by Flux
@@ -82,6 +91,12 @@ spec:
   path: ./platform/apps/overlays/dev
   prune: true
   wait: true
+```
+
+Once Flux synced, the data services came up, but the producer and consumer releases were rejected. Because the Helm chart is pulled straight from Git, Flux appends the commit to the chart version (`0.1.0+e2fd74d44688`). The chart used that version in its `helm.sh/chart` label, and Kubernetes doesn't allow `+` in labels. Sanitizing the label fixed both releases.
+
+```yaml
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 ```
 
 ### 4. Built the Producer and Consumer for Failure
@@ -114,6 +129,10 @@ The maximum is six replicas, matching the topic's six partitions, because Kafka 
 
 Flux's drift detection is enabled on both apps, so a manual `kubectl scale` or `kubectl set env` gets reverted to what Git says. The consumer's replica count is the one field excluded, since KEDA owns it.
 
+**Load test (`make load-test`).** Four producers pushed about 2,750 events per second while each consumer batch was slowed to simulate heavier processing. Lag climbed past 700,000 messages, and KEDA scaled the consumer from 1 to 6 replicas within about a minute, which is the cap set by the topic's six partitions. Once the load stopped, the six consumers drained the backlog to zero in roughly five minutes, and KEDA scaled them back down one pod at a time.
+
+<img width="900" src="docs/images/04-load-test.png" alt="Screenshot: Grafana during the load test, with producer throughput near 2,750 events per second, consumer group lag peaking above 700K, KEDA scaling the consumer from 1 to 6 replicas, and end-to-end latency rising then recovering"/>
+
 ### 6. Added Observability and Alerting
 
 Both apps expose Prometheus metrics, including throughput, batch write time, sink errors, dead-letter count, and an end-to-end latency histogram measuring the time from event creation to landing in both stores. The Strimzi Kafka Exporter adds consumer-group lag. A Grafana dashboard, provisioned from a ConfigMap in Git, shows all of it alongside the current consumer replica count.
@@ -128,14 +147,17 @@ Nine alert rules cover the failures that matter most, and each one links to a ru
           for: 5m
 ```
 
-<!-- TODO: screenshot of the Grafana Event Pipeline dashboard -->
-<img width="900" src="docs/images/02-grafana-dashboard.png" alt="Screenshot: Grafana dashboard showing throughput, consumer lag, KEDA replica count, and end-to-end latency"/>
+Under normal traffic (about 5 to 9 events per second), lag stays in the single digits, one consumer replica is enough, and end-to-end latency sits around 600 ms at p50 and about 2 seconds at p95.
+
+<img width="900" src="docs/images/02-grafana-dashboard.png" alt="Screenshot: Grafana Event Pipeline dashboard under normal traffic, with low lag, one consumer replica, and sub-second p50 latency"/>
 
 ### 7. Separated Environments and Gated Promotion
 
 The pipeline is defined once in a Kustomize base, and dev and prod overlays layer on only what differs. Prod drops the synthetic producer, runs three Elasticsearch nodes and three PostgreSQL instances, keeps a minimum of two consumers, and retains Kafka volumes when the cluster is deleted.
 
 Every merge to `main` runs tests, builds both images, scans them with Trivy, pushes them to ECR, and commits the new tag to the dev overlay, which Flux then rolls out. Promoting to prod is a separate workflow that copies the tested tag into the prod overlay and opens a pull request with a checklist, so prod only changes after review.
+
+The Trivy step originally referenced a GitHub Action tag that no longer resolved, so both build jobs failed before starting. I switched to running Trivy from its official container image, which doesn't depend on the action's tag naming.
 
 ```yaml
   - patch: |-
@@ -150,61 +172,50 @@ Every merge to `main` runs tests, builds both images, scans them with Trivy, pus
 
 Any pull request that touches Terraform runs a Checkov scan and a `terraform plan` under the read-only role, then posts the plan as a comment on the PR. Infrastructure changes get reviewed the same way as application code, with the exact diff in front of the reviewer. A separate CI workflow lints the Python, runs unit tests, lints and renders the Helm chart with and without KEDA, and schema-validates every rendered manifest with kubeconform.
 
-<!-- TODO: screenshot of a Terraform plan comment on a pull request -->
-<img width="700" src="docs/images/03-terraform-plan-comment.png" alt="Screenshot: GitHub pull request with an automated Terraform plan comment"/>
+<img width="900" src="docs/images/07-ci-checks.png" alt="Screenshot: GitHub Actions ci workflow with terraform, python, and kubernetes jobs passing"/>
 
-### 9. Validated the Platform Under Load and Failure
+### 9. Validated Failover by Breaking It
 
 Each design choice was tested by creating the situation it's meant to handle, not just by confirming the happy path works.
 
-**Load test (`make load-test`)**
+**PostgreSQL primary failover (`scripts/chaos-test.sh postgres`)**
 
-<!-- TODO: screenshot of the load-test output or the KEDA replica panel climbing -->
-<img width="700" src="docs/images/04-load-test.png" alt="Screenshot: consumer replicas scaling up as Kafka lag climbs during a load test"/>
+I deleted the primary database pod while the consumer was actively writing. CloudNativePG detected the loss within a second and started a failover, then promoted the replica (`events-db-2`) once the old primary had fully stopped. The cluster was healthy again in about three minutes.
 
-**Chaos tests (`scripts/chaos-test.sh`)**
+Most of that time was deliberate. CloudNativePG first attempts a smart shutdown, which waits for open client connections to close, and the consumer held one open. It also refuses to promote the replica until the old primary is gone, which prevents two databases from accepting writes at once. Faster failover would mean lowering `smartShutdownTimeout`, trading some safety for speed.
 
-<!-- TODO: screenshot of a Postgres failover or broker loss, with the alert that fired -->
-<img width="700" src="docs/images/05-chaos-test.png" alt="Screenshot: recovery after a PostgreSQL primary failover, with the alert firing and then resolving"/>
+<img width="700" src="docs/images/05-chaos-test.png" alt="Screenshot: CloudNativePG cluster back in a healthy state with the replica promoted to primary"/>
 
-**Pipeline run with all checks passing**
+**Build and release run: test, build and scan both images, push to ECR, and commit the new tag**
 
-<!-- TODO: screenshot of a green GitHub Actions run -->
-<img width="700" src="docs/images/06-pipeline-green.png" alt="Screenshot: GitHub Actions run with test, build, scan, and deploy jobs passing"/>
+<img width="900" src="docs/images/06-pipeline-green.png" alt="Screenshot: GitHub Actions build-and-release run with test, two build jobs, and bump-tag passing"/>
 
 ---
 
 ## Platform Controls
 
-<!-- TODO: fill in the Validation column with your real results from docs/failure-tests.md -->
-
 | Control | Without it | With it | Validation |
 |---|---|---|---|
-| Consumer scaling | Fixed replica count; falls behind under load | KEDA scales 1-6 replicas on Kafka lag | Load test: scaled to _ replicas, drained _ messages of lag in _ |
-| Delivery guarantees | Offsets committed before writes; events lost on crash | Commit only after both sinks succeed; idempotent writes | Consumer killed mid-batch: _ lost, _ duplicates |
-| Kafka durability | Single broker; one failure stops writes | 3 brokers, replication factor 3, min ISR 2 | Broker deleted: recovered in _ s, producer kept writing |
-| Database availability | Single Postgres pod | Primary + replica with automatic failover | Primary deleted: failover in _ s |
-| Configuration drift | Manual changes persist silently | Flux drift detection restores Git state | `kubectl scale` reverted in _ |
-| Environment promotion | Deploy straight to prod | Dev auto-deploys; prod changes only via reviewed PR | Promotion PR opened and merged for image `_` |
-| Infrastructure review | `terraform apply` unreviewed | Checkov scan and plan posted on every PR | Plan comment generated on PR #_ |
-| Pipeline credentials | Stored AWS access keys | OIDC roles scoped to `main` and to pull requests | No AWS secrets in the repo or GitHub settings |
-| Failure visibility | Find out from users | 9 alert rules with runbooks | `_` alert fired during the _ test |
+| Database availability | Single Postgres pod | Primary + replica with automatic failover | Primary deleted under load: replica promoted, healthy in ~3 min |
+| Pipeline credentials | Stored AWS access keys | OIDC roles scoped to `main` and to pull requests | No AWS secrets in the repo or GitHub settings; builds push to ECR through OIDC |
+| GitOps delivery | `kubectl apply` by hand | Flux syncs the cluster from Git in dependency order | Operators, data services, and apps deployed from a single bootstrap |
+| Image security | Unscanned images | Trivy scan blocks fixable critical CVEs before push | Scan runs on every build |
+| Consumer scaling | Fixed replica count; falls behind under load | KEDA scales 1-6 replicas on Kafka lag | ~2,750 events/s: scaled 1 → 6 in about a minute, 700K+ lag drained in ~5 min |
+| Kafka durability | Single broker; one failure stops writes | 3 brokers, replication factor 3, min ISR 2 | Not yet tested |
+| Configuration drift | Manual changes persist silently | Flux drift detection restores Git state | Not yet tested |
 
 ---
 
 ## Timeline of Build Events
 
-<!-- TODO: adjust to match the order you actually built things, and add the problems you hit along the way -->
-
 1. **Local Pipeline Built**: Producer and consumer running end to end with Docker Compose, with unit tests for the enrichment logic.
-2. **Platform Provisioned**: VPC, EKS, ECR, and IAM deployed with Terraform, with remote state in S3.
-3. **OIDC Configured**: GitHub federated to AWS with no stored keys, using separate push and plan roles.
-4. **GitOps Bootstrapped**: Flux installed; operators, monitoring, and the pipeline deployed from Git in dependency order.
-5. **CI/CD Wired Up**: Tests, Trivy scans, image builds, and automatic dev deploys on every merge.
-6. **Autoscaling Added**: KEDA scaling the consumer on Kafka lag, with tuned scale-down behavior.
-7. **Alerting Added**: Prometheus rules, Grafana dashboard, and runbooks.
-8. **Environments Split**: Dev and prod overlays with a PR-based promotion workflow and Terraform plans on pull requests.
-9. **Platform Validated**: Load test and chaos tests run against the live cluster, with results recorded.
+2. **Remote State Created**: S3 bucket for Terraform state, provisioned by a separate bootstrap stack.
+3. **Platform Provisioned**: VPC, EKS, ECR, and IAM deployed with Terraform, after recovering from expired credentials mid-apply, a 5-vCPU account quota, and a Free plan instance restriction.
+4. **OIDC Configured**: GitHub federated to AWS with no stored keys. The trust policy was updated to match GitHub's immutable subject format.
+5. **CI/CD Wired Up**: Tests, Trivy scans, image builds, and automatic dev deploys on every merge. Trivy was moved from a broken action tag to its container image.
+6. **GitOps Bootstrapped**: Flux installed; operators, monitoring, and the pipeline deployed from Git in dependency order. A chart label rejected by Kubernetes was fixed.
+7. **Autoscaling Validated**: Load test at about 2,750 events per second; KEDA scaled the consumer to its six-replica cap and the backlog drained once load stopped.
+8. **Failover Validated**: PostgreSQL primary deleted under load; the replica was promoted and the cluster recovered in about three minutes.
 
 ---
 
@@ -214,10 +225,11 @@ Each design choice was tested by creating the situation it's meant to handle, no
 # 1. Run locally
 make local-up && make test
 
-# 2. Provision AWS
-aws configure
-make state                                         # one-time S3 bucket for Terraform state
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # set github_owner and your IP
+# 2. Provision AWS (account must be on the paid plan, not the Free plan)
+aws login
+make state                     # one-time S3 bucket for Terraform state
+# create terraform/terraform.tfvars with github_owner, endpoint_public_access_cidrs,
+# node sizing, and github_oidc_sub_prefix if the repo uses immutable OIDC subjects
 make tf-init && make tf-apply
 
 # 3. Wire up CI (sets GitHub variables), then build the first images
@@ -225,7 +237,7 @@ make configure
 git push && gh workflow run build-and-release
 
 # 4. Install Flux and let it deploy everything
-export GITHUB_TOKEN=<personal access token>
+export GITHUB_TOKEN=<classic token with repo scope>
 ./scripts/bootstrap-flux.sh <github-owner>
 make status
 
@@ -236,32 +248,33 @@ make load-test
 make teardown
 ```
 
-**Requirements:** an AWS account with admin access (Terraform creates IAM roles), AWS CLI v2, Terraform 1.10+, kubectl, Helm 3, the Flux CLI, the GitHub CLI, and Docker for local runs. Full setup and troubleshooting are in [docs/setup.md](docs/setup.md). Running the cluster costs roughly $0.25-0.35 an hour on spot instances.
+**Requirements:** an AWS account on the paid plan with at least 4 vCPUs of on-demand EC2 quota, admin access (Terraform creates IAM roles), AWS CLI v2, Terraform 1.10+, kubectl, Helm 3, the Flux CLI, the GitHub CLI, and Docker for local runs. Full setup and troubleshooting are in [docs/setup.md](docs/setup.md). The cluster costs roughly $0.30 an hour with two on-demand nodes.
 
 ---
 
 ## Summary
 
-This project runs a stateful event streaming platform on Amazon EKS where every piece, from the VPC to the image tag running in each environment, is defined in code and delivered through Git. Kafka, PostgreSQL, and Elasticsearch run under their operators with replication and failover. The consumer scales on Kafka lag rather than CPU, commits progress only after both writes succeed, and handles replays without creating duplicates. Changes flow through tested, scanned, and reviewed pipelines, credentials are short-lived throughout, and the platform's behavior under load and failure was validated by actually causing both.
+This project runs a stateful event streaming platform on Amazon EKS where every piece, from the VPC to the image tag running in each environment, is defined in code and delivered through Git. Kafka, PostgreSQL, and Elasticsearch run under their operators with replication and failover. The consumer scales on Kafka lag rather than CPU, commits progress only after both writes succeed, and handles replays without creating duplicates. Changes flow through tested, scanned, and reviewed pipelines, credentials are short-lived throughout, and both autoscaling and database failover were validated against the live cluster.
 
 ---
 
 ## Lessons Learned
 
-<!-- TODO: replace or add to these with what you actually ran into. Specific problems you hit and fixed are the most convincing part of this section. -->
-
-- **Scale on the bottleneck, not the default metric.** A consumer waiting on I/O can be badly behind with almost no CPU usage. Lag measures what users actually feel.
-- **Partition count caps your parallelism.** Consumers beyond the partition count do nothing, so autoscaling limits have to be set with the topic design in mind.
-- **At-least-once delivery requires idempotent writes.** Committing offsets after the writes prevents data loss, but it guarantees some replays, so every sink has to handle seeing the same event twice.
-- **Autoscaling can't fix a downstream outage.** When a sink is down, lag grows and KEDA adds consumers that all wait on the same broken dependency. Alerting has to catch that case, because scaling won't.
-- **Git should be the only way to change the cluster.** Drift detection turns "someone ran a `kubectl` command" from a silent problem into something that gets corrected automatically.
+- **Silent failures need a different kind of debugging.** The node group sat in `CREATING` for 30 minutes without an error. The clue was what was missing: no Auto Scaling group and no instances, which pointed to an account limit rather than a configuration problem.
+- **Check account limits before the first apply.** A 5-vCPU quota and a Free plan restriction both blocked node launches. A quick look at Service Quotas and the account plan would have saved most of an afternoon.
+- **Long-running applies need credentials that outlast them.** Temporary credentials expiring mid-apply left the state split between S3 and a local file. Recovering meant pushing the saved state, releasing the lock, and untainting the cluster, in that order.
+- **Identity formats change.** GitHub's immutable OIDC subject embeds numeric IDs, so a trust policy written for the classic format rejected every login with no hint about why. Comparing what the role expected against what GitHub sent found it.
+- **Generated values end up in unexpected places.** Flux appends the Git revision to chart versions, and that version flowed into a label where `+` isn't allowed. Anything derived from a version string should be sanitized before it becomes a label.
+- **Partitions set the ceiling on scaling.** During the load test, KEDA hit six replicas within a minute and stayed there, because the topic has six partitions. Past that point, more consumers would sit idle, so handling more load means adding partitions first.
+- **Safe failover isn't instant failover.** The Postgres failover took about three minutes because the operator waited for client connections to close and for the old primary to stop before promoting the replica. That delay is the price of never having two primaries accepting writes.
+- **Health checks should watch the cluster, not a role label.** My first chaos script waited on the pod labeled "primary," which briefly doesn't exist during a failover, so the script exited early even though the failover succeeded.
 
 ---
 
 ## Next Steps
 
-- Run stateful workloads on an on-demand node group and keep spot capacity, or Karpenter, for stateless pods.
+- Run the Kafka broker and drift tests, and repeat the load test with 12 partitions to compare drain time.
+- Lower `smartShutdownTimeout` and measure how much faster failover gets.
 - Turn TLS back on for Elasticsearch and switch Kafka clients to mTLS with per-application users and ACLs.
 - Apply Terraform automatically on merge behind a GitHub Environment with required reviewers.
 - Stand up the prod overlay on a second cluster instead of only rendering it.
-- Route Alertmanager notifications to Slack and pin all GitHub Actions to full commit SHAs.
